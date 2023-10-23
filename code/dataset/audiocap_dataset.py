@@ -45,7 +45,7 @@ class AudioCapDataset(BaseDataset):
         with open(data_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         for row in tqdm(data, total=len(data)):
-            audio_id, one_caption = row["audio_name"], row["caption"]
+            audio_id, one_caption = row["audio"], row["caption"]
             self.mm_path_list.append(os.path.join(mm_root_path, audio_id))
             self.caption_list.append(process_caption(one_caption))
 

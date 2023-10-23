@@ -18,6 +18,7 @@ class DeepSpeedAgent:
         
         # load config parameters of deepspeed
         ds_params = json.load(open(self.args['ds_config_path']))
+        print('using params in:',self.args['ds_config_path'])
         ds_params['scheduler']['params']['total_num_steps'] = self.args['total_steps']
         ds_params['scheduler']['params']['warmup_num_steps'] = max(10, int(
             self.args['total_steps'] * self.args['warmup_rate']))
@@ -108,26 +109,37 @@ class DeepSpeedAgent:
         linear = 0
         llama = 0
         imagebind = 0
+        languagebind_img =0
+        languagebind_depth =0
+        languagebind_video =0
+        languagebind_audio =0
         for name, param in self.model.named_parameters():
             num_params = param.numel()
+            # print('the name:',name,' and all nums:',num_params)
             # if using DS Zero 3 and the weights are initialized empty
             if num_params == 0 and hasattr(param, "ds_numel"):
                 num_params = param.ds_numel
 
             if 'lora' in name:
                 lora += num_params
-            elif 'gen_text_hidden_fcs_video' in name:
-                video += num_params
-            elif 'gen_text_hidden_fcs_audio' in name:
-                audio += num_params
-            elif 'gen_text_hidden_fcs' in name:
-                image += num_params
+            # elif 'gen_text_hidden_fcs_video' in name:
+            #     video += num_params
+            # elif 'gen_text_hidden_fcs_audio' in name:
+            #     audio += num_params
+            # elif 'gen_text_hidden_fcs' in name:
+            #     image += num_params
             elif 'llama_proj' in name:
                 linear += num_params
             elif 'llama_model' in name:
                 llama += num_params
             elif 'visual_encoder' in name:
-                imagebind += num_params
+                languagebind_img += num_params
+            elif 'video_encoder' in name:
+                languagebind_video += num_params
+            elif 'depth_encoder' in name:
+                languagebind_depth += num_params
+            elif 'audio_encoder' in name:
+                languagebind_audio += num_params
             else:
                 pass
 
@@ -140,7 +152,7 @@ class DeepSpeedAgent:
             f"all params: {all_param:,d} || trainable params: {trainable_params:,d} || trainable%: {100 * trainable_params / all_param}"
         )
         print(f'lora params: {lora:,d} || video params: {video:,d} || audio params: {audio:,d} || image params: {image:,d}')
-        print(f'linear params: {linear:,d} || imagebind params: {imagebind:,d} || llama params: {llama:,d}')
+        print(f'linear params: {linear:,d} || video params: {languagebind_video:,d} || depth params: {languagebind_depth:,d} || audio params: {languagebind_audio:,d} || image params: {languagebind_img:,d} || llama params: {llama:,d}')
 
     def load_parameters(self, path):
         if os.path.exists(os.path.join(path, 'pytorch_model.pt')):

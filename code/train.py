@@ -22,7 +22,7 @@ def parser_args():
 
 def initialize_distributed(args):
     args['master_ip'] = os.getenv('MASTER_ADDR', 'localhost')
-    args['master_port'] = os.getenv('MASTER_PORT', '6000')
+    args['master_port'] = os.getenv('MASTER_PORT', '8080')
     args['world_size'] = int(os.getenv('WORLD_SIZE', '1'))
     args['local_rank'] = int(os.getenv('RANK', '0')) % torch.cuda.device_count()
     device = args['local_rank'] % torch.cuda.device_count()
@@ -41,7 +41,7 @@ def set_random_seed(seed):
 
 
 def config_env(args):
-    args['root_dir'] = '../'
+    args['root_dir'] = '/hy-tmp/NExT-GPT-main/'
     # args['mode'] = 'train'
     config = load_config(args)
     args.update(config)
@@ -59,7 +59,7 @@ def build_directory(path):
 def main(**args):
     config_env(args)
     print(args)
-    args['ds_config_path'] = f'dsconfig/stage_{args["stage"]}.json'
+    args['ds_config_path'] = f'/hy-tmp/NExT-GPT-main/code/dsconfig/stage_{args["stage"]}.json'
     dschf = HfDeepSpeedConfig(args['ds_config_path'])
     args['dschf'] = dschf
 

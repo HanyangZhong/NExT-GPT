@@ -8,13 +8,14 @@ import torch.nn.functional as F
 from .ImageBind import *
 from .ImageBind import data
 from .modeling_llama import LlamaForCausalLM
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import StoppingCriteria, StoppingCriteriaList,AutoTokenizer
 # from diffusers import StableDiffusionPipeline
 from .custom_sd import StableDiffusionPipeline
 from .custom_vd import TextToVideoSDPipeline
 from .custom_ad import AudioLDMPipeline
 from .layers import *
 from .common.utils import *
+from .LanguageBind.languagebind import LanguageBind, to_device, transform_dict, LanguageBindImageTokenizer
 
 
 class StoppingCriteriaSub(StoppingCriteria):
@@ -50,21 +51,48 @@ class NextGPTModel(nn.Module):
         self.stage = args['stage']
         print('args max_length', args['max_length'])
 
-        imagebind_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], 'imagebind_ckpt',
-                                           self.args['imagebind_version'])
-        print(f'Initializing visual encoder from {imagebind_ckpt_path} ...')
-        self.visual_encoder, self.visual_hidden_size = \
-            imagebind_model.imagebind_huge(pretrained=True, store_path=imagebind_ckpt_path)
+        # 加载多模态头
+        clip_type = ('image', 'audio','depth','video')
+        languagebind_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], self.args['languagebind_version'])
+        encoder_model= LanguageBind(clip_type=clip_type, cache_dir='./cache_dir')
+        
+        self.visual_encoder = encoder_model.modality_encoder['image']
+        self.audio_encoder = encoder_model.modality_encoder['audio']
+        self.depth_encoder = encoder_model.modality_encoder['depth']
+        self.video_encoder = encoder_model.modality_encoder['video']
+        
+        self.visual_hidden_size = 768
+        # print('encoder:',self.visual_encoder)
+        # print('hidden sizes:',encoder_model.modality_proj)
+        # 设置模态加载函数
+        self.modality_transform = {c: transform_dict[c](encoder_model.modality_config[c]) for c in clip_type}
+
+        # imagebind_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], 'imagebind_ckpt',
+        #                                    self.args['imagebind_version'])
+        print(f'Initializing visual encoder from {languagebind_ckpt_path} ...')
+        # self.visual_encoder, self.visual_hidden_size = \
+        #     imagebind_model.imagebind_huge(pretrained=True, store_path=imagebind_ckpt_path)
         # free vision encoder
+        # 冻结encoder参数
         for name, param in self.visual_encoder.named_parameters():
             param.requires_grad = False
         self.visual_encoder.eval()
+        for name, param in self.audio_encoder.named_parameters():
+            param.requires_grad = False
+        self.audio_encoder.eval()
+        for name, param in self.depth_encoder.named_parameters():
+            param.requires_grad = False
+        self.depth_encoder.eval()
+        for name, param in self.video_encoder.named_parameters():
+            param.requires_grad = False
+        self.video_encoder.eval()
         print('Visual encoder initialized.')
 
-        self.vicuna_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], 'vicuna_ckpt',
+        self.vicuna_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], 
                                              self.args['vicuna_version'])
         print(f'Initializing language decoder from {self.vicuna_ckpt_path} ...')
 
+        # 加载LLM
         self.llama_model = LlamaForCausalLM.from_pretrained(self.vicuna_ckpt_path)
         if self.args.get('freeze_lm'):
             print("Freezing the LLaMa ...")
@@ -72,6 +100,7 @@ class NextGPTModel(nn.Module):
                 param.requires_grad = False
             self.llama_model.eval()
         else:
+            # 微调LLM
             print("Instruct tuning the LLaMa ...")
             # add the lora module
             peft_config = LoraConfig(
@@ -90,100 +119,111 @@ class NextGPTModel(nn.Module):
         # use the new trained tokenizer
         tokenizer_path = self.vicuna_ckpt_path
         print(f'Initializing tokenizer from {tokenizer_path} ...')
-        self.llama_tokenizer = LlamaTokenizer.from_pretrained(tokenizer_path, use_fast=False)
+        # LLM的tokenizer
+        self.llama_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
+        # self.llama_tokenizer = LlamaTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
         self.llama_tokenizer.padding_side = "right"
         # self.llama_tokenizer.add_special_tokens({"mask_token": "[MASK]"})
-        self._add_image_token()
-        self._add_video_token()
-        self._add_audio_token()
+        # 对应多模态decoder 不需要
+        # self._add_image_token()
+        # self._add_video_token()
+        # self._add_audio_token()
         self.llama_model.resize_token_embeddings(len(self.llama_tokenizer))
         print('Tokenizer initialized.')
 
+        # 投影层
         self.llama_proj = nn.Linear(
             self.visual_hidden_size, self.llama_model.config.hidden_size
         )
+        # 冻结投影层
         if self.args.get('freeze_input_proj'):
             for param in self.llama_proj.parameters():
                 param.requires_grad = False
 
+        # 输入嵌入
         self.input_embeddings = self.llama_model.get_input_embeddings()
 
         # the alignment module for LLM-TO-IMAGE
-        self.sd_ckpt_path = self.args['image_diffusion']
-        self.gen_text_hidden_fcs = nn.ModuleList([])
-        for layer_idx in self.args['text_emb_to_img_layers']:
-            if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
-                in_dim = self.llama_model.config.hidden_size
+        # text到图像输出 不需要
+        # self.sd_ckpt_path = self.args['image_diffusion']
+        # self.gen_text_hidden_fcs = nn.ModuleList([])
+        # for layer_idx in self.args['text_emb_to_img_layers']:
+        #     if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
+        #         in_dim = self.llama_model.config.hidden_size
 
-                self.gen_text_hidden_fcs.append(
-                    TextFcLayer(in_dim, 768, num_input_tokens=self.args['num_gen_img_tokens'],
-                                num_output_tokens=self.args['num_clip_tokens'],
-                                mode=self.args['text_fc_to_img_mode']))
-            # self.sd_pipe.text_encoder.config.hidden_size
-            elif layer_idx < self.llama_model.config.num_hidden_layers:
-                self.gen_text_hidden_fcs.append(
-                    TextFcLayer(self.llama_model.config.hidden_size, 768,
-                                num_input_tokens=self.args['num_gen_img_tokens'],
-                                num_output_tokens=self.args['num_clip_tokens'],
-                                mode=self.args['text_fc_to_img_mode']))
-            else:
-                raise ValueError(
-                    f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
+        #         self.gen_text_hidden_fcs.append(
+        #             TextFcLayer(in_dim, 768, num_input_tokens=self.args['num_gen_img_tokens'],
+        #                         num_output_tokens=self.args['num_clip_tokens'],
+        #                         mode=self.args['text_fc_to_img_mode']))
+        #     # self.sd_pipe.text_encoder.config.hidden_size
+        #     elif layer_idx < self.llama_model.config.num_hidden_layers:
+        #         self.gen_text_hidden_fcs.append(
+        #             TextFcLayer(self.llama_model.config.hidden_size, 768,
+        #                         num_input_tokens=self.args['num_gen_img_tokens'],
+        #                         num_output_tokens=self.args['num_clip_tokens'],
+        #                         mode=self.args['text_fc_to_img_mode']))
+        #     else:
+        #         raise ValueError(
+        #             f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
 
         # the alignment module for LLM-TO-VIDEO
-        self.vd_ckpt_path = self.args['video_diffusion']
-        self.gen_text_hidden_fcs_video = nn.ModuleList([])
-        for layer_idx in self.args['text_emb_to_video_layers']:
-            if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
-                in_dim = self.llama_model.config.hidden_size  # 4096
+        # text到视频输出 不需要
+        # self.vd_ckpt_path = self.args['video_diffusion']
+        # self.gen_text_hidden_fcs_video = nn.ModuleList([])
+        # for layer_idx in self.args['text_emb_to_video_layers']:
+        #     if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
+        #         in_dim = self.llama_model.config.hidden_size  # 4096
 
-                self.gen_text_hidden_fcs_video.append(
-                    TextFcLayer(in_dim, 1024, num_input_tokens=self.args['num_gen_video_tokens'],
-                                num_output_tokens=self.args['num_clip_tokens'],
-                                mode=self.args['text_fc_to_video_mode']))
-            # self.vd_pipe.text_encoder.config.hidden_size
-            elif layer_idx < self.llama_model.config.num_hidden_layers:
-                self.gen_text_hidden_fcs_video.append(
-                    TextFcLayer(self.llama_model.config.hidden_size, 1024,
-                                num_input_tokens=self.args['num_gen_video_tokens'],
-                                num_output_tokens=self.args['num_clip_tokens'],
-                                mode=self.args['text_fc_to_video_mode']))
-            else:
-                raise ValueError(
-                    f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
+        #         self.gen_text_hidden_fcs_video.append(
+        #             TextFcLayer(in_dim, 1024, num_input_tokens=self.args['num_gen_video_tokens'],
+        #                         num_output_tokens=self.args['num_clip_tokens'],
+        #                         mode=self.args['text_fc_to_video_mode']))
+        #     # self.vd_pipe.text_encoder.config.hidden_size
+        #     elif layer_idx < self.llama_model.config.num_hidden_layers:
+        #         self.gen_text_hidden_fcs_video.append(
+        #             TextFcLayer(self.llama_model.config.hidden_size, 1024,
+        #                         num_input_tokens=self.args['num_gen_video_tokens'],
+        #                         num_output_tokens=self.args['num_clip_tokens'],
+        #                         mode=self.args['text_fc_to_video_mode']))
+        #     else:
+        #         raise ValueError(
+        #             f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
 
         # the alignment module for LLM-TO-AUDIO
-        self.ad_ckpt_path = self.args['audio_diffusion']
-        self.gen_text_hidden_fcs_audio = nn.ModuleList([])
-        for layer_idx in self.args['text_emb_to_audio_layers']:
-            if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
-                in_dim = self.llama_model.config.hidden_size
+        # text到视频输出 不需要
+        # self.ad_ckpt_path = self.args['audio_diffusion']
+        # self.gen_text_hidden_fcs_audio = nn.ModuleList([])
+        # for layer_idx in self.args['text_emb_to_audio_layers']:
+        #     if layer_idx == -1 or layer_idx == self.llama_model.config.num_hidden_layers:
+        #         in_dim = self.llama_model.config.hidden_size
 
-                self.gen_text_hidden_fcs_audio.append(
-                    TextFcLayer(in_dim, 512,
-                                num_input_tokens=self.args['num_gen_audio_tokens'],
-                                num_output_tokens=1,
-                                mode=self.args['text_fc_to_audio_mode']))
-            # self.ad_pipe.text_encoder.config.projection_dim
-            elif layer_idx < self.llama_model.config.num_hidden_layers:
-                self.gen_text_hidden_fcs_audio.append(
-                    TextFcLayer(self.llama_model.config.hidden_size, 512,
-                                num_input_tokens=self.args['num_gen_audio_tokens'],
-                                num_output_tokens=1,
-                                mode=self.args['text_fc_to_audio_mode']))
-            else:
-                raise ValueError(
-                    f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
+        #         self.gen_text_hidden_fcs_audio.append(
+        #             TextFcLayer(in_dim, 512,
+        #                         num_input_tokens=self.args['num_gen_audio_tokens'],
+        #                         num_output_tokens=1,
+        #                         mode=self.args['text_fc_to_audio_mode']))
+        #     # self.ad_pipe.text_encoder.config.projection_dim
+        #     elif layer_idx < self.llama_model.config.num_hidden_layers:
+        #         self.gen_text_hidden_fcs_audio.append(
+        #             TextFcLayer(self.llama_model.config.hidden_size, 512,
+        #                         num_input_tokens=self.args['num_gen_audio_tokens'],
+        #                         num_output_tokens=1,
+        #                         mode=self.args['text_fc_to_audio_mode']))
+        #     else:
+        #         raise ValueError(
+        #             f'Embedding of layer {layer_idx} was requested but model only has {self.llama_model.config.num_hidden_layers} layers.')
 
-        if self.args.get('freeze_output_proj'):
-            for name, param in self.gen_text_hidden_fcs.named_parameters():
-                param.requires_grad = False
-            for name, param in self.gen_text_hidden_fcs_video.named_parameters():
-                param.requires_grad = False
-            for name, param in self.gen_text_hidden_fcs_audio.named_parameters():
-                param.requires_grad = False
+        # 冻结输出头
+        # if self.args.get('freeze_output_proj'):
+        #     for name, param in self.gen_text_hidden_fcs.named_parameters():
+        #         param.requires_grad = False
+        #     for name, param in self.gen_text_hidden_fcs_video.named_parameters():
+        #         param.requires_grad = False
+        #     for name, param in self.gen_text_hidden_fcs_audio.named_parameters():
+        #         param.requires_grad = False
 
+    # decoder到图像 不需要
     def _add_image_token(self):
         # Add an image token for loss masking (and visualization) purposes.
         self.llama_tokenizer.add_tokens({"<Img>"})  # add special image token to tokenizer
@@ -202,6 +242,7 @@ class NextGPTModel(nn.Module):
             assert len(gen_token_idx) == 1, gen_token_idx
             self.args['gen_img_token_idx'].append(gen_token_idx[0])
 
+    # decoder到video 不需要
     def _add_video_token(self):
         # self.llama_tokenizer.add_tokens({"<Vid>"})  # add special video token to tokenizer
         # self.llama_tokenizer.add_tokens({"</Vid>"})  # add special video token to tokenizer
@@ -219,6 +260,7 @@ class NextGPTModel(nn.Module):
             assert len(gen_token_idx) == 1, gen_token_idx
             self.args['gen_video_token_idx'].append(gen_token_idx[0])
 
+    # decoder到audio 不需要
     def _add_audio_token(self):
         # self.llama_tokenizer.add_tokens({"<Aud>"})  # add special audio token to tokenizer
         # self.llama_tokenizer.add_tokens({"</Aud>"})  # add special audio token to tokenizer
@@ -236,39 +278,67 @@ class NextGPTModel(nn.Module):
             assert len(gen_token_idx) == 1, gen_token_idx
             self.args['gen_audio_token_idx'].append(gen_token_idx[0])
 
+    # 编码视频
     def encode_video(self, video_paths):
-        inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
+        # inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
+        inputs = {
+        'video': to_device(self.modality_transform['video'](video_paths), self.device)
+        }
         # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
-            embeddings = self.visual_encoder(inputs)
-            video_embeds = embeddings[ModalityType.VISION]  # bsz x 1024
+            embeddings = self.video_encoder(inputs)
+            video_embeds = embeddings['video']  # bsz x 1024
         inputs_llama = self.llama_proj(video_embeds).unsqueeze(1)  # bsz x 1 x llama_size
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device)  # bsz x 1
         return inputs_llama, atts_llama
 
-    def encode_audio(self, audio_paths):
-        inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
+    # 编码深度
+    def encode_depth(self, depth_paths):
+        # inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
+        inputs = {
+        'depth': to_device(self.modality_transform['depth'](depth_paths), self.device)
+        }
         # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
-            embeddings = self.visual_encoder(inputs)
-            audio_embeds = embeddings[ModalityType.AUDIO]  # bsz x 1024
+            embeddings = self.depth_encoder(inputs)
+            depth_embeds = embeddings['depth']  # bsz x 1024
+        inputs_llama = self.llama_proj(depth_embeds).unsqueeze(1)  # bsz x 1 x llama_size
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device)  # bsz x 1
+        return inputs_llama, atts_llama
+
+    # 编码音频
+    def encode_audio(self, audio_paths):
+        # inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
+        inputs = {
+        'audio': to_device(self.modality_transform['audio'](audio_paths), self.device)
+        }
+        # convert into visual dtype
+        inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
+        with torch.no_grad():
+            embeddings = self.audio_encoder(inputs)
+            audio_embeds = embeddings['audio']  # bsz x 1024
         inputs_llama = self.llama_proj(audio_embeds).unsqueeze(1)  # bsz x 1 x llama_size
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device)  # bsz x 1
         return inputs_llama, atts_llama
 
+    # 编码图片
     def encode_image(self, image_paths):
-        inputs = {ModalityType.VISION: data.load_and_transform_vision_data(image_paths, self.device)}
+        # inputs = {ModalityType.VISION: data.load_and_transform_vision_data(image_paths, self.device)}
+        inputs = {
+        'image': to_device(self.modality_transform['image'](image_paths), self.device)
+        }
         # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
             embeddings = self.visual_encoder(inputs)
-            image_embeds = embeddings['vision']  # bsz x 1024
+            image_embeds = embeddings['image']  # bsz x 1024
         inputs_llama = self.llama_proj(image_embeds).unsqueeze(1)  # bsz x 1 x llama_size
         atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device)  # bsz x 1
         return inputs_llama, atts_llama
 
+    # 生成图片prompt
     def prompt_wrap(self, img_embeds, input_ids, target_ids, attention_mask):
         '''
             input_ids, target_ids, attention_mask: bsz x s2
@@ -343,26 +413,29 @@ class NextGPTModel(nn.Module):
             assert attention_mask.size() == targets.size()  # bsz x (1 + s1 + s2)
         return inputs_embeds, targets, attention_mask
 
+    # 生成部分，只需要文字
     def _train_with_mode(self, texts, img_embeds=None, modality='text', num_gen_tokens='8',
                          text_hidden_fcs=None, gen_token_idx=None, text_emb_layers=None, text_prompt_embeddins=None,
                          loss_scale=1.0, stage=2):
         """
-        :param num_gen_tokens: the number of generation tokens
-        :param modality: mode can be 'image' / 'video' / 'audio' / 'text'
-        :param text_hidden_fcs: alignment module
-        :param gen_token_idx: List
-        :param text_emb_layers: the layer index of LLM hidden states
-        :param text_prompt_embeddins: the textual caption/prompt embeddings
-        :param loss_scale: the scale on the mse loss for alignment
-        :param stage: the training stage
+        :param num_gen_tokens: the number of generation tokens              生成部分
+        :param modality: mode can be 'image' / 'video' / 'audio' / 'text'   输入部分
+        :param text_hidden_fcs: alignment module                            生成部分
+        :param gen_token_idx: List                                          生成部分
+        :param text_emb_layers: the layer index of LLM hidden states        生成部分
+        :param text_prompt_embeddins: the textual caption/prompt embeddings 生成部分
+        :param loss_scale: the scale on the mse loss for alignment          比值 视频用两帧图像输入要乘2
+        :param stage: the training stage                
         :param
         """
+        # 多模态decoder对齐 不需要
         if stage == 2:
             input_ids, target_ids, attention_mask = process_batch_stage_2(self.llama_tokenizer, texts,
                                                                           self.max_length,
                                                                           num_gen_tokens,
                                                                           modality
                                                                           )
+        # 指令微调阶段 不需要多模态输出
         elif stage == 3:
             input_ids, target_ids, attention_mask = process_batch_stage_3(self.llama_tokenizer, texts, self.max_length,
                                                                           self.args['num_gen_img_tokens'],
@@ -371,8 +444,10 @@ class NextGPTModel(nn.Module):
                                                                           )
         else:
             raise NotImplementedError
+        # 输入图片经过encoder 变成向量和 mask label
         inputs_embeds, targets, attention_mask = self.prompt_wrap(img_embeds, input_ids, target_ids, attention_mask)
 
+        # 输入嵌入向量 attention mask 输出
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -381,6 +456,7 @@ class NextGPTModel(nn.Module):
             labels=targets,
         )
 
+        # 计算loss
         loss = outputs.loss
         # calculate the token accuracy
         chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]  # [B, S-1]
@@ -390,55 +466,59 @@ class NextGPTModel(nn.Module):
         valid_tokens = gen_acc & valid_mask  # [B*S]
         gen_acc = valid_tokens.sum().item() / (valid_mask.sum().item() + 1.0)
 
+        # 文字输出计算loss
         if modality == 'text':
             return loss, gen_acc, torch.zeros_like(loss)
-        else:
-            hidden_states = []
-            # text_hidden_fcs = self.gen_text_hidden_fcs
+        # 多模态输出loss 不需要
+        # else:
+        #     hidden_states = []
+        #     # text_hidden_fcs = self.gen_text_hidden_fcs
 
-            # based on the targets to obtain the hidden state, targets includes the [BOS] token
-            start_pos = (targets == gen_token_idx[0]).nonzero(as_tuple=False)[:, 1].tolist()
-            end_pos = (targets == gen_token_idx[-1]).nonzero(as_tuple=False)[:, 1].tolist()
-            # logging.info(f'targets : {targets}')
-            # logging.info(f'start_pos : {start_pos}')
-            # logging.info(f'end_pos : {end_pos}')
-            assert 0 < len(start_pos) == len(end_pos) == input_ids.size(0) and len(end_pos) > 0, (start_pos, end_pos)
-            for idx, fc_layer in zip(text_emb_layers, text_hidden_fcs):
-                hidden_embedding = []
-                input_embedding = []
-                for b, (s, e) in enumerate(zip(start_pos, end_pos)):
-                    assert e - s + 1 == num_gen_tokens, (s, e)
-                    hidden_embedding.append(outputs.hidden_states[idx][b, s:e + 1, :])
-                    input_embedding.append(self.input_embeddings(targets[b, s:e + 1]))
-                hidden_embedding = torch.stack(hidden_embedding, dim=0)
-                input_embedding = torch.stack(input_embedding, dim=0)
-                hidden_states.append(fc_layer(hidden_embedding, input_embedding))  # (N, seq_len, 2048)
-            embeddings = torch.stack(hidden_states, dim=-1).sum(dim=-1)  # (N, 77, 768)
-            # embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)  # (N, T_I_V_A.txt, 256)
+        #     # based on the targets to obtain the hidden state, targets includes the [BOS] token
+        #     start_pos = (targets == gen_token_idx[0]).nonzero(as_tuple=False)[:, 1].tolist()
+        #     end_pos = (targets == gen_token_idx[-1]).nonzero(as_tuple=False)[:, 1].tolist()
+        #     # logging.info(f'targets : {targets}')
+        #     # logging.info(f'start_pos : {start_pos}')
+        #     # logging.info(f'end_pos : {end_pos}')
+        #     assert 0 < len(start_pos) == len(end_pos) == input_ids.size(0) and len(end_pos) > 0, (start_pos, end_pos)
+        #     for idx, fc_layer in zip(text_emb_layers, text_hidden_fcs):
+        #         hidden_embedding = []
+        #         input_embedding = []
+        #         for b, (s, e) in enumerate(zip(start_pos, end_pos)):
+        #             assert e - s + 1 == num_gen_tokens, (s, e)
+        #             hidden_embedding.append(outputs.hidden_states[idx][b, s:e + 1, :])
+        #             input_embedding.append(self.input_embeddings(targets[b, s:e + 1]))
+        #         hidden_embedding = torch.stack(hidden_embedding, dim=0)
+        #         input_embedding = torch.stack(input_embedding, dim=0)
+        #         hidden_states.append(fc_layer(hidden_embedding, input_embedding))  # (N, seq_len, 2048)
+        #     embeddings = torch.stack(hidden_states, dim=-1).sum(dim=-1)  # (N, 77, 768)
+        #     # embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)  # (N, T_I_V_A.txt, 256)
 
-            # Obtain the embeddings produced by the text encoder of a frozen text-to-image generation model
-            input_text = [conversation for conversation in texts]
+        #     # Obtain the embeddings produced by the text encoder of a frozen text-to-image generation model
+        #     input_text = [conversation for conversation in texts]
 
-            if modality == 'image':
-                mse_loss = l2_loss(embeddings, torch.stack(text_prompt_embeddins, dim=0).to(self.device))
-            elif modality == 'video':
-                mse_loss = l2_loss(embeddings, torch.stack(text_prompt_embeddins, dim=0).to(self.device))
-            else:
-                text_prompt_embeddins = torch.stack(text_prompt_embeddins, dim=0).to(self.device)
-                assert len(text_prompt_embeddins.shape) == 2, text_prompt_embeddins.shape
-                text_prompt_embeddins = text_prompt_embeddins.view(text_prompt_embeddins.size(0), 1,
-                                                                   text_prompt_embeddins.size(1))
-                mse_loss = l2_loss(embeddings, text_prompt_embeddins)
-            mse_loss = mse_loss.mean()
-            loss += loss_scale * mse_loss
+        #     if modality == 'image':
+        #         mse_loss = l2_loss(embeddings, torch.stack(text_prompt_embeddins, dim=0).to(self.device))
+        #     elif modality == 'video':
+        #         mse_loss = l2_loss(embeddings, torch.stack(text_prompt_embeddins, dim=0).to(self.device))
+        #     else:
+        #         text_prompt_embeddins = torch.stack(text_prompt_embeddins, dim=0).to(self.device)
+        #         assert len(text_prompt_embeddins.shape) == 2, text_prompt_embeddins.shape
+        #         text_prompt_embeddins = text_prompt_embeddins.view(text_prompt_embeddins.size(0), 1,
+        #                                                            text_prompt_embeddins.size(1))
+        #         mse_loss = l2_loss(embeddings, text_prompt_embeddins)
+        #     mse_loss = mse_loss.mean()
+        #     loss += loss_scale * mse_loss
 
-            return loss, gen_acc, mse_loss
+        #     return loss, gen_acc, mse_loss
 
+    # 预训练对齐
     def _enc_align_training_stage_1(self, inputs):
         """
         In the stage 1: training the encoding-side alignment via image/video/audio caption tasks
-        modality: the input modality for each caption task, it could be 'image', 'video' or 'audio'.
+        modality: the input modality for each caption task, it could be 'image', 'video' or 'audio' or 'depth'.
         """
+        # 模态选择 经过encoder变成向量
         dataset_type = inputs['dataset_types'][0]
         if dataset_type == 'ImageToText':
             image_paths = inputs['mm_paths']
@@ -449,13 +529,18 @@ class NextGPTModel(nn.Module):
         elif dataset_type == 'AudioToText':
             audio_paths = inputs['mm_paths']
             mm_embeds, _ = self.encode_audio(audio_paths)
+        elif dataset_type == 'DepthToText':
+            depth_paths = inputs['mm_paths']
+            mm_embeds, _ = self.encode_depth(depth_paths)
         else:
             raise NotImplementedError
+        # 对预训练数据进行处理 变成对应输入向量id label 以及 attention mask
         input_ids, target_ids, attention_mask = process_batch_stage_1(self.llama_tokenizer,
                                                                       inputs['output_texts'],
                                                                       self.max_length,
                                                                       self.args['prompt'])
         # print(input_ids)
+        # 输入向量     输出向量 和 mask label
         inputs_embeds, targets, attention_mask = self.prompt_wrap(mm_embeds, input_ids, target_ids, attention_mask)
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
@@ -464,7 +549,7 @@ class NextGPTModel(nn.Module):
             output_hidden_states=True,
             labels=targets,
         )
-
+        # 计算loss
         loss = outputs.loss
         # calculate the token accuracy
         chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]  # [B, S-1]
@@ -475,6 +560,7 @@ class NextGPTModel(nn.Module):
         gen_acc = valid_tokens.sum().item() / (valid_mask.sum().item() + 1.0)
         return loss, gen_acc
 
+    # 多模态输出对齐 不需要
     def _dec_align_training_stage_2(self, inputs):
         """
         In the stage 2: training the decoding-side alignment via minimize the distance between the
@@ -513,7 +599,8 @@ class NextGPTModel(nn.Module):
             raise NotImplementedError
 
         return loss, gen_acc, mse_loss
-
+    
+    # 指令微调 单一模态与文字
     def _instruction_tuning_stage_3(self, inputs):
         """
         In the stage 3: instruction-following training via the instruction dataset.
@@ -523,6 +610,7 @@ class NextGPTModel(nn.Module):
         mse_loss = []
 
         dataset_type = inputs['dataset_types'][0]
+        # 多模态输出 图片
         if dataset_type == 'TextToImage':
             loss, gen_acc, mse_loss = self._train_with_mode(inputs['output_texts'], None, 'image',
                                                             self.args['num_gen_img_tokens'],
@@ -530,6 +618,7 @@ class NextGPTModel(nn.Module):
                                                             self.args['gen_img_token_idx'],
                                                             self.args['text_emb_to_img_layers'],
                                                             inputs['caption_embs'], stage=self.stage)
+        # 多模态输出 视频
         elif dataset_type == 'TextToVideo':
             loss, gen_acc, mse_loss = self._train_with_mode(inputs['output_texts'], None, 'video',
                                                             self.args['num_gen_video_tokens'],
@@ -538,6 +627,7 @@ class NextGPTModel(nn.Module):
                                                             self.args['text_emb_to_video_layers'],
                                                             inputs['caption_embs'], loss_scale=2,
                                                             stage=self.stage)
+        # 多模态输出 音频
         elif dataset_type == 'TextToAudio':
             loss, gen_acc, mse_loss = self._train_with_mode(inputs['output_texts'], None, 'audio',
                                                             self.args['num_gen_audio_tokens'],
@@ -545,11 +635,31 @@ class NextGPTModel(nn.Module):
                                                             self.args['gen_audio_token_idx'],
                                                             self.args['text_emb_to_audio_layers'],
                                                             inputs['caption_embs'], stage=self.stage)
+        # 多模态输入 图片
         elif dataset_type == 'ImageToText':
             image_paths = inputs['mm_paths']
             img_embeds, _ = self.encode_image(image_paths)
             loss, gen_acc, _ = self._train_with_mode(inputs['output_texts'], img_embeds, modality='text',
                                                      stage=self.stage)
+        # 多模态输入 音频
+        elif dataset_type == 'AudioToText':
+            audio_paths = inputs['mm_paths']
+            img_embeds, _ = self.encode_audio(audio_paths)
+            loss, gen_acc, _ = self._train_with_mode(inputs['output_texts'], img_embeds, modality='text',
+                                                     stage=self.stage)
+        # 多模态输入 深度
+        elif dataset_type == 'DepthToText':
+            depth_paths = inputs['mm_paths']
+            img_embeds, _ = self.encode_depth(depth_paths)
+            loss, gen_acc, _ = self._train_with_mode(inputs['output_texts'], img_embeds, modality='text',
+                                                     stage=self.stage)
+        # 多模态输入 视频
+        elif dataset_type == 'VideoToText':
+            Video_paths = inputs['mm_paths']
+            img_embeds, _ = self.encode_video(Video_paths)
+            loss, gen_acc, _ = self._train_with_mode(inputs['output_texts'], img_embeds, modality='text',
+                                                     stage=self.stage)
+        # 文字输入输出
         elif dataset_type == 'TextToText':
             loss, gen_acc, _ = self._train_with_mode(inputs['output_texts'], None, modality='text',
                                                      stage=self.stage)
@@ -557,6 +667,7 @@ class NextGPTModel(nn.Module):
             raise NotImplementedError
         return loss, gen_acc, mse_loss
 
+    # 跨模态对齐
     def _stage_4_training(self, inputs):
         """
         In the stage 4, we employ the modality-switch dataset to instruction-tune the overall framework
@@ -579,6 +690,7 @@ class NextGPTModel(nn.Module):
 
         return loss, gen_acc, mse_loss
 
+    # 多模态特征提取 叠加
     def extract_multimodal_feature(self, inputs):
         features = []
         if inputs['image_paths']:
@@ -672,6 +784,7 @@ class NextGPTModel(nn.Module):
         feature_embeds = torch.cat(features).sum(dim=0).unsqueeze(0)
         return torch.cat([p_before_embeds, feature_embeds, p_after_embeds], dim=1)
 
+    # 生成嵌入
     def prepare_generation_embedding(self, inputs):
         prompt = inputs['prompt']
         text = prompt + '\n### Assistant:'
@@ -716,6 +829,7 @@ class NextGPTModel(nn.Module):
         """
         stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=inputs['stops_id'], encounters=1)])
 
+        # 生成模型
         outputs = self.llama_model.generate(
             inputs_embeds=input_embeds,
             max_new_tokens=inputs['max_tgt_len'],
@@ -747,6 +861,7 @@ class NextGPTModel(nn.Module):
 
         return out, output_embeddings, video_output_embedding, audio_output_embedding
 
+    # 生成图像 不需要
     def generate_images(self, generated_ids, embeddings, all_gen_idx, generation_model=None,
                         guidance_scale=7.5, num_inference_steps=40):
         """
@@ -794,6 +909,7 @@ class NextGPTModel(nn.Module):
             return_outputs.append(image_outputs)
         return return_outputs
 
+    # 生成视频 不需要
     def generate_videos(self, generated_ids, embeddings, all_gen_idx, generation_model=None,
                         guidance_scale=7.5, num_inference_steps=40, height=320, width=576, num_frames=16):
         """
@@ -848,6 +964,7 @@ class NextGPTModel(nn.Module):
             return_outputs.append(video_outputs)
         return return_outputs
 
+    # 生成音频 不需要
     def generate_audios(self, generated_ids, embeddings, all_gen_idx, generation_model=None,
                         guidance_scale=7.5, num_inference_steps=40, audio_length_in_s=5.0):
         """
@@ -895,6 +1012,7 @@ class NextGPTModel(nn.Module):
             return_outputs.append(audio_outputs)
         return return_outputs
 
+    # 生成模块 不需要
     def generate(self, inputs):
         """
             inputs = {

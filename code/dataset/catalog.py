@@ -5,10 +5,10 @@ class DatasetCatalog:
     def __init__(self):
         # the following dataset utilized for encoding-side alignment learning
         self.audiocap_enc = {
-            "target": "dataset.audiocap_datase.AudioCapDataset",
+            "target": "dataset.audiocap_dataset.AudioCapDataset",
             "params": dict(
-                data_path="../data/T-X_pair_data/audiocap/audiocap.json",
-                mm_root_path="../data/T-X_pair_data/audiocap/audios",
+                data_path="/hy-tmp/audiocap/out.json",
+                mm_root_path="/hy-tmp/audiocap/all_audio",
                 embed_path="../data/embed/",
                 dataset_type="AudioToText",
             ),
@@ -27,10 +27,20 @@ class DatasetCatalog:
         self.cc3m_enc = {
             "target": "dataset.cc3m_dataset.CC3MDataset",
             "params": dict(
-                data_path="../data/T-X_pair_data/cc3m/cc3m.json",
-                mm_root_path="../data/T-X_pair_data/cc3m/images",
+                data_path="/hy-tmp/CC3M/cc3m_file.json",
+                mm_root_path="/hy-tmp/CC3M/image",
                 embed_path="../data/embed/",
                 dataset_type="ImageToText",
+            ),
+        }
+
+        self.depth_dataset_enc = {
+            "target": "dataset.depth_dataset.depthDataset",
+            "params": dict(
+                data_path="/hy-tmp/depth/depth_file.json",
+                mm_root_path="/hy-tmp/depth/image",
+                embed_path="../data/embed/",
+                dataset_type="DepthToText",
             ),
         }
 
