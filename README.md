@@ -1,7 +1,6 @@
 # RobotGPT
  Use NEXT-GPT to add other multi modal ability
  ![87d226193dfe9d894651013c31d4c01](https://github.com/HanyangZhong/NExT-GPT/assets/119017394/84ea71b8-0b08-49fe-8324-097b5a89a028)
-
 # The current progress 
 ## Pretrain
 ### Image encoder
