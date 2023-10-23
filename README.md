@@ -25,7 +25,7 @@ Detail setting for Json file: /pretrain/audiocap_setup.zip
 In check_files.py, it would be suggested to set files at least larger than 100k.  
 That can help reducing dataset problem.
 
-### Depth encoder
+### Depth encoder(Optional)
 The RGBD dataset is washington-RGBD.  
 RGBD Dataset:   
 ```
